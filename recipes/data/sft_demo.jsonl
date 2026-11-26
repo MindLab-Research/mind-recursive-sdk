@@ -1,0 +1,8 @@
+{"messages": [{"role": "user", "content": "What is 2+2?"}, {"role": "assistant", "content": "2+2 equals 4."}]}
+{"messages": [{"role": "user", "content": "Name a primary colour."}, {"role": "assistant", "content": "Red is a primary colour."}]}
+{"messages": [{"role": "user", "content": "What is the capital of France?"}, {"role": "assistant", "content": "Paris is the capital of France."}]}
+{"messages": [{"role": "user", "content": "How many days in a week?"}, {"role": "assistant", "content": "There are seven days in a week."}]}
+{"messages": [{"role": "system", "content": "Answer in one short sentence."}, {"role": "user", "content": "Why is the sky blue?"}, {"role": "assistant", "content": "Sunlight scatters off air molecules, and blue scatters most."}]}
+{"messages": [{"role": "user", "content": "Translate 'hello' to French."}, {"role": "assistant", "content": "'Hello' is 'bonjour' in French."}]}
+{"messages": [{"role": "user", "content": "What is 10 divided by 4?"}, {"role": "assistant", "content": "10 divided by 4 is 2.5."}]}
+{"messages": [{"role": "user", "content": "Is water wet?"}, {"role": "assistant", "content": "Water makes other things wet, so yes in everyday terms."}]}
