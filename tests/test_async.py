@@ -146,3 +146,112 @@ async def test_async_heartbeat_runs_on_the_event_loop():
         relay.count(f"/api/mindrsi/v1/service/session/{session_id}/heartbeat") >= 1
     )
     await service.aclose()
+
+
+def _record_events(monkeypatch, service) -> list[tuple[str, dict]]:
+    records: list[tuple[str, dict]] = []
+    monkeypatch.setattr(
+        service._reporter, "_record", lambda kind, body: records.append((kind, body))
+    )
+    return records
+
+
+def _events(records: list[tuple[str, dict]]) -> list[dict]:
+    return [body for kind, body in records if kind == "event"]
+
+
+@pytest.mark.asyncio
+async def test_async_create_reports_trainer_and_sampler(monkeypatch):
+    """The async twins register the same lifecycle facts as the sync calls."""
+    relay = FakeRelay()
+    service = build_async_service(relay)
+    records = _record_events(monkeypatch, service)
+    session_id = service.session_id
+
+    trainer = await service.create_lora_trainer_async(
+        base_model="Qwen/Qwen3.8-27B", rank=16
+    )
+    sampler = await trainer.create_sampler_async(
+        model_path="mint://run-abc/sampler/step-1"
+    )
+    await service.aclose()
+
+    events = _events(records)
+    assert [event["type"] for event in events] == [
+        "trainer.created",
+        "sampler.created",
+        "session.closing",
+    ]
+    assert events[0]["data"]["model_id"] == trainer.model_id
+    assert events[0]["data"]["rank"] == 16
+    assert events[1]["data"]["sampling_session_id"] == sampler.sampling_session_id
+    assert events[2]["data"]["session_id"] == session_id
+
+
+@pytest.mark.asyncio
+async def test_async_resume_reports_the_checkpoint(monkeypatch):
+    relay = FakeRelay()
+    service = build_async_service(relay)
+    records = _record_events(monkeypatch, service)
+    state = "mint://run-abc/checkpoints/step-3"
+
+    await service.create_lora_trainer_from_state_async(
+        state,
+        base_model="Qwen/Qwen3.8-27B",
+        load_optimizer=True,
+    )
+    await service.aclose()
+
+    event = _events(records)[0]
+    assert event["type"] == "trainer.resumed"
+    assert event["data"]["state_path"] == state
+    assert event["data"]["load_optimizer"] is True
+
+
+@pytest.mark.asyncio
+async def test_async_close_keeps_the_closing_note(monkeypatch):
+    relay = FakeRelay()
+    service = build_async_service(relay)
+    records = _record_events(monkeypatch, service)
+
+    await service.aclose("success", detail="all 3 steps done")
+
+    event = _events(records)[-1]
+    assert event["type"] == "session.closing"
+    assert event["data"]["status"] == "success"
+    assert event["data"]["detail"] == "all 3 steps done"
+
+
+@pytest.mark.asyncio
+async def test_async_close_twice_reports_once(monkeypatch):
+    relay = FakeRelay()
+    service = build_async_service(relay)
+    records = _record_events(monkeypatch, service)
+
+    await service.aclose()
+    await service.aclose()
+
+    assert [event["type"] for event in _events(records)] == ["session.closing"]
+
+
+@pytest.mark.asyncio
+async def test_async_save_and_load_report_completion(monkeypatch):
+    relay = FakeRelay()
+    service = build_async_service(relay)
+    records = _record_events(monkeypatch, service)
+    trainer = await service.create_lora_trainer_async(
+        base_model="Qwen/Qwen3.8-27B", rank=8
+    )
+    records.clear()
+
+    path = await trainer.save_weights_only_async("async-save")
+    await trainer.load_weights_async(path, optimizer=False)
+
+    events = _events(records)
+    assert [event["type"] for event in events] == [
+        "save.completed",
+        "weights.loaded",
+    ]
+    assert events[0]["data"]["path"] == path
+    assert "ttl_seconds" not in events[0]["data"]
+    assert events[1]["data"]["optimizer"] is False

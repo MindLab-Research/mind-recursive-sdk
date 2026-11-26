@@ -190,12 +190,43 @@ def test_save_and_get_sampling_client_uses_a_distinct_path_per_step(relay_servic
     assert not [r for r in relay.requests if r.path.endswith(REPORT_ARTIFACT_SUFFIX)]
 
 
-def test_save_and_get_sampling_client_name_is_ignored_with_a_warning(relay_service):
+def test_ephemeral_names_count_per_trainer(relay_service):
+    """Exports are keyed by training model, so two trainers may both start at
+    ``ephemeral-1``; the sequence only has to be distinct within one trainer."""
     relay, service = relay_service
+    first = service.create_lora_trainer(base_model="Qwen/Qwen3.8-27B")
+    second = service.create_lora_trainer(base_model="Qwen/Qwen3.8-27B")
+
+    first.save_weights_and_get_sampling_client()
+    second.save_weights_and_get_sampling_client()
+
+    paths = [r.json()["path"] for r in relay.requests_to(SAVE_FOR_SAMPLER)]
+    assert paths == ["ephemeral-1", "ephemeral-1"]
+
+
+def test_save_and_get_sampling_client_takes_no_name(service):
+    """A name that silently did nothing was worse than no name at all.
+
+    Ported code that passes one now fails on the call rather than saving a
+    throwaway the caller believes it named.
+    """
     trainer = service.create_lora_trainer(base_model="Qwen/Qwen3.8-27B")
-    with pytest.warns(DeprecationWarning, match="no effect"):
+    with pytest.raises(TypeError):
         trainer.save_weights_and_get_sampling_client("step-1")
-    assert relay.last(SAVE_FOR_SAMPLER).json()["path"].startswith("ephemeral-")
+
+
+def test_the_tinker_spelling_is_a_real_alias():
+    """Same function object, so the two names cannot drift apart."""
+    from mind_recursive.trainer import LoraTrainer
+
+    assert (
+        LoraTrainer.save_weights_and_get_sampling_client
+        is LoraTrainer.save_weights_and_get_sampler
+    )
+    assert (
+        LoraTrainer.save_weights_and_get_sampling_client_async
+        is LoraTrainer.save_weights_and_get_sampler_async
+    )
 
 
 def test_save_and_get_sampling_client_carries_record_stability_info(relay_service):
@@ -216,10 +247,10 @@ def test_save_and_get_sampling_client_inflight_skips_the_save(relay_service):
     assert relay.count(SAVE_FOR_SAMPLER) == 0
 
 
-def test_save_and_get_sampling_client_inflight_rejects_a_name(service):
+def test_save_and_get_sampling_client_rejects_an_unknown_kind(service):
     trainer = service.create_lora_trainer(base_model="Qwen/Qwen3.8-27B")
-    with pytest.raises(ValueError, match="inflight"):
-        trainer.save_weights_and_get_sampling_client("step-1", kind="inflight")
+    with pytest.raises(ValueError, match="kind must be"):
+        trainer.save_weights_and_get_sampling_client(kind="bogus")
 
 
 def test_retry_config_is_rejected_rather_than_ignored(service):

@@ -8,6 +8,9 @@ SDK 同时提供同步和原生 async 两套调用方式，走同一组 HTTP 接
 - 同步方法直接返回结果或 `APIFuture`；`*_async` 方法返回 awaitable，`await` 后拿到最终结果。
 - `ServiceClient` 的构造函数仍然是同步的（它要创建 session）；之后所有训练、采样、上报查询都有 async 版本。
 - 异步调用结束后用 `await sc.aclose()`，它会结束 session 并关闭 async / sync 两个连接池。
+  传 `status` / `detail` 时会和同步 `close()` 一样记入 `session.closing` 事件。
+- 生命周期事件（`trainer.created` / `trainer.resumed` / `sampler.created` /
+  `session.closing`）在 async 路径上同样自动上报；上报走工作线程，不阻塞事件循环。
 - 心跳仍在后台线程运行，不阻塞事件循环。
 
 ## 示例
@@ -24,7 +27,8 @@ async def main():
         out = await trainer.forward_backward_async(batch)
         await trainer.optim_step_async()
 
-        sampler = await trainer.save_weights_and_get_sampler_async("step-10")
+        # 临时导出：自动命名、24h 过期。要留下权重用 save_weights_only_async
+        sampler = await trainer.save_weights_and_get_sampler_async()
 
         # 并发采样：所有请求同时发出，事件循环负责等待。
         results = await asyncio.gather(*[

@@ -19,23 +19,53 @@ state_path = trainer.save_state("step-100").result()
 
 两者的返回值都是 `APIFuture[str]`，`.result()` 得到路径。
 
+## checkpoint 会过期
+
+`save_state` 默认在请求里带 `ttl_seconds=259200`（72 小时），所以 state path 默认
+只有三天可用。要留更久就自己传：
+
+```python
+# 默认 72 小时
+state = trainer.save_state("step-500").result()
+
+# 自己定
+state = trainer.save_state("step-500", ttl_seconds=86400 * 30).result()
+
+# 不发这个字段
+state = trainer.save_state("step-500", ttl_seconds=None).result()
+```
+
+`save_weights_only` 默认不带 `ttl_seconds`：这是留给长期保留的权重，需要按 TTL
+回收时自己传。
+
 命名规则：`name` 必须非空，只能包含 ASCII 字母、数字、`-`、`_`、`.`，且不能是
 `.` 或 `..`。SDK 在本地校验，不合法会抛 `ConfigurationError`，不会发请求。
 
 两者都接受 `overwrite=False`：同名保存默认报冲突（`ConflictError`），要覆盖必须
 显式传 `overwrite=True`。
 
-`save_weights_only` 不能用 `ephemeral` 前缀作名字。`save_weights_and_get_sampling_client()`
-每步把临时导出存成 `ephemeral-<seq>`，所以这些名字是保留的，SDK 在本地直接拒绝，
-抛 `ConfigurationError`。
+`ephemeral` 前缀留给 SDK 的临时导出：`save_weights_and_get_sampler()` 每次自动命名
+`ephemeral-<seq>`（每个 trainer 内递增），并带 24 小时 TTL。因此
+`save_weights_only` 不允许用 `ephemeral` 或 `ephemeral-` 开头作名字，SDK 在本地直接
+拒绝，抛 `ConfigurationError`。
 
-两种保存的区别：
+持久保存和临时导出的区别：
 
-- **持久保存**：传 `name`（`save_weights_only` / `save_weights_and_get_sampler`），
-  想留下的权重走这条路。
-- **临时保存**：`save_weights_and_get_sampling_client()`，不传 `name`。每步存一个
-  `ephemeral-<seq>`、24 小时后过期；推理服务要先部署这份权重才能采样，所以每步会建
-  一个临时部署，新部署就绪后释放上一个。适合 RL 每步采样。
+- **持久保存**：`save_weights_only(name)` / `save_state(name)`。必须传 `name`，会登记
+  artifact。`save_state` 默认带 72 小时 TTL，`save_weights_only` 默认不带 TTL。
+  **想留下的权重只走这条路。**
+- **临时导出**：`save_weights_and_get_sampler()`（Tinker 拼法
+  `save_weights_and_get_sampling_client()` 是它的真别名）。不接 `name`、不接
+  `ttl_seconds`：SDK 自动命名、固定带 24 小时 TTL、不登记 artifact。推理服务要先
+  部署这份权重才能采样，所以每步会建一个临时部署，新部署就绪后释放上一个。适合 RL
+  每步采样。
+
+要留下权重、同时又要采样，就分两步：
+
+```python
+path = trainer.save_weights_only("step-100").result()
+sampler = trainer.create_sampler(model_path=path)
+```
 
 保存成功后，路径会自动登记为 artifact：`save_weights_only` 登记
 `sampler_weights`，`save_state` 登记 `checkpoint`。不需要再调用 `sc.artifact()`。
@@ -99,11 +129,34 @@ trainer = sc.create_lora_trainer_from_state(
 ```
 
 `trainer.lora_config` 只有在 `rank`、`train_mlp`、`train_attn` **三个都显式给出**
-时才有值，否则是 `None`。effective rank 用：
+时才有值，否则是 `None`。
+
+`get_info()` 也查不到 effective rank：它只反映这次建模请求里显式带上的 LoRA 字段。
+续训时不传 `rank`，无论 checkpoint 存的是什么，都会得到：
 
 ```python
-trainer.get_info().lora_rank
+info = trainer.get_info()
+info.is_lora    # False
+info.lora_rank  # None
 ```
+
+注意 `is_lora` 这里是 `False` 而不是 `None`——它是个错值，不是缺值。如果你的代码靠
+它判断模型是不是 LoRA，会走错分支。
+
+这只影响 `get_info()` 的回读，不影响续训本身。要让这两个字段有意义，续训时显式传
+`rank`：
+
+```python
+trainer = sc.create_lora_trainer_from_state(
+    state_path,
+    base_model="Qwen/Qwen3.8-27B",
+    rank=8,  # 必须与 checkpoint 一致，否则是覆盖而不是回读
+)
+trainer.get_info().lora_rank  # 8
+```
+
+显式传 `rank` 是覆盖参数，不是查询参数：传错值会改变这次训练的结构，所以只在你已经
+知道 checkpoint 的 rank 时这样做。
 
 ### 路径类型
 

@@ -28,16 +28,19 @@ sampler = sc.create_sampler(
 ### 从 LoraTrainer
 
 ```python
-# 保存一份再采：权重固定，跨 step 可比
-sampler = trainer.save_weights_and_get_sampler("step-100")
+# 临时导出再采：SDK 自动命名 ephemeral-<seq>（每个 trainer 内递增）、24 小时后过期、不登记 artifact
+sampler = trainer.save_weights_and_get_sampler()
 
-# 等价于分两步
+# 要留下这份权重：自己存，再开 sampler
 path = trainer.save_weights_only("step-100").result()
 sampler = trainer.create_sampler(model_path=path)
 
 # 不保存，跟随当前训练权重
 sampler = trainer.create_sampler(kind="inflight")
 ```
+
+`save_weights_and_get_sampler()` 不接 `name` 也不接 `ttl_seconds`：它存的是一份用完
+就扔的导出。**想留下的权重走 `save_weights_only(name)`**，再用 `create_sampler`。
 
 `kind` 决定采哪份权重：
 

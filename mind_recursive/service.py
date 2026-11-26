@@ -45,6 +45,69 @@ log = logging.getLogger("mind_recursive.service")
 SDK_VERSION = _SDK_VERSION
 
 
+def _trainer_lifecycle(
+    model_id: str, body: Mapping[str, Any]
+) -> tuple[str, str, dict[str, Any]]:
+    """Build the lifecycle event for a resolved trainer create."""
+    state_path = body.get("state_path")
+    details: dict[str, Any] = {
+        "model_id": model_id,
+        "base_model": body.get("base_model"),
+    }
+    if state_path:
+        details["state_path"] = state_path
+        summary = f"trainer resumed from checkpoint: {model_id}"
+        event_type = "trainer.resumed"
+        if body.get("load_optimizer") is not None:
+            details["load_optimizer"] = body["load_optimizer"]
+    else:
+        summary = f"trainer created: {model_id}"
+        event_type = "trainer.created"
+    lora = body.get("lora_config")
+    if isinstance(lora, Mapping) and lora.get("rank") is not None:
+        details["rank"] = lora["rank"]
+    return event_type, summary, details
+
+
+def _sampler_lifecycle(
+    sampling_session_id: str,
+    *,
+    kind: SamplerKind,
+    base_model: str | None = None,
+    model_path: str | None = None,
+    model_id: str | None = None,
+) -> tuple[str, str, dict[str, Any]]:
+    """Build the lifecycle event for a resolved sampler create."""
+    details: dict[str, Any] = {
+        "sampling_session_id": sampling_session_id,
+        "kind": kind,
+    }
+    if base_model:
+        details["base_model"] = base_model
+    if model_path:
+        details["model_path"] = model_path
+    if model_id:
+        details["model_id"] = model_id
+    return (
+        "sampler.created",
+        f"sampler created ({kind}): {sampling_session_id}",
+        details,
+    )
+
+
+def _closing_lifecycle(
+    session_id: str, status: str | None, detail: str | None
+) -> tuple[str, str, dict[str, Any]]:
+    """Build the lifecycle event for a session that is closing."""
+    data: dict[str, Any] = {"session_id": session_id}
+    if status:
+        data["status"] = status
+    if detail:
+        data["detail"] = detail
+    note = f" ({status})" if status else ""
+    return "session.closing", f"session closing{note}", data
+
+
 class ServiceClient:
     """One training session on the Mind Recursive platform, opened on construction.
 
@@ -110,6 +173,10 @@ class ServiceClient:
             trust_env=trust_env,
         )
         self._transport = Transport(self._config)
+        # Retry diagnostics are reported as events, best-effort. The callback
+        # is set before the session exists; _on_retry stays silent until there
+        # is a session to address.
+        self._transport.on_retry = self._on_retry
         self._heartbeat_seconds = heartbeat_seconds
         self._name = name
         self._async_transport: AsyncTransport | None = None
@@ -127,6 +194,9 @@ class ServiceClient:
         self._pending_metadata: dict[str, Any] = dict(user_metadata or {})
         self._model_seq = 0
         self._sampling_seq = 0
+        #: Set by the first close path to report ``session.closing``, so a
+        #: second close -- sequential or concurrent -- does not report again.
+        self._closing_reported = False
         #: One reporter per client, and it lives on the client: a session has
         #: exactly one writer, so there is nothing to create or disambiguate.
         self._reporter = Reporter(service=self)
@@ -260,12 +330,31 @@ class ServiceClient:
         emit(f"Session created: {self._session_id}")
         emit(f"Web console: {web_session_url(self._config.web_url, self._session_id)}")
 
+        # Terminal already shows the two lines above, so report the event
+        # without echoing it a third time.
+        session_details: dict[str, Any] = {
+            "session_id": self._session_id,
+            "sdk_version": SDK_VERSION,
+        }
+        if self._client_id:
+            session_details["client_id"] = self._client_id
+        if self._name:
+            session_details["name"] = self._name
+        if self._pending_tags:
+            session_details["tags"] = list(self._pending_tags)
+        self._reporter.event(
+            "session.created",
+            message=f"session created: {self._session_id}",
+            data=session_details,
+        )
+
         self._heartbeat = Heartbeat(
             self._send_heartbeat,
             interval=self._heartbeat_seconds,
             # 410 means the server reclaimed the session. Retrying a beat for a
             # resource that is gone only adds noise; the contract says stop.
             stop_on=(GoneError,),
+            on_failure=self._on_heartbeat_failure,
         )
         self._heartbeat.start()
         log.debug("opened session %s", self._session_id)
@@ -397,7 +486,13 @@ class ServiceClient:
             A :class:`~mind_recursive.LoraTrainer`. ``trainer.lora_config`` is
             ``None`` unless ``rank``, ``train_mlp`` and ``train_attn`` were all
             passed: the effective structure lives on the server and this
-            release has no read-back for it (``get_info()`` returns the rank).
+            release has no read-back for it. ``get_info()`` is not that
+            read-back either -- it echoes the LoRA fields this call actually
+            sent, so a resume that omits ``rank`` reports
+            ``is_lora=False, lora_rank=None`` however the checkpoint was
+            saved. The server still trains with the checkpoint's own
+            structure; only the report is blank. Pass ``rank`` explicitly if
+            you need either field to be meaningful.
         """
         from .trainer import LoraTrainer
 
@@ -636,6 +731,16 @@ class ServiceClient:
             self.resolver(base_url=self._config.service_base_url),
             P.parse_sampling_session_id,
         ).result()
+        # Only a resolved sampler is reported, so a deployment that never came
+        # up leaves no "created" claim behind it.
+        event_type, summary, sampler_details = _sampler_lifecycle(
+            str(sampling_session_id),
+            kind=kind,
+            base_model=base_model,
+            model_path=model_path,
+            model_id=model_id,
+        )
+        self._reporter.lifecycle(event_type, summary, data=sampler_details)
         return Sampler(
             service=self,
             sampling_session_id=str(sampling_session_id),
@@ -727,6 +832,7 @@ class ServiceClient:
         model_id = await self.async_resolver(
             base_url=self._config.service_base_url
         ).resolve(request_id, timeout=None, parse=P.parse_model_id)
+        await self._report_lifecycle_async(_trainer_lifecycle(model_id, body))
         return LoraTrainer(
             service=self, model_id=model_id, base_model=base_model, lora_config=lora
         )
@@ -797,6 +903,7 @@ class ServiceClient:
         model_id = await self.async_resolver(
             base_url=self._config.service_base_url
         ).resolve(request_id, timeout=None, parse=P.parse_model_id)
+        await self._report_lifecycle_async(_trainer_lifecycle(model_id, body))
         config = (
             LoraConfig(rank=rank, train_mlp=train_mlp, train_attn=train_attn)
             if rank is not None and train_mlp is not None and train_attn is not None
@@ -919,6 +1026,15 @@ class ServiceClient:
         sampling_session_id = await self.async_resolver(
             base_url=self._config.service_base_url
         ).resolve(request_id, timeout=None, parse=P.parse_sampling_session_id)
+        await self._report_lifecycle_async(
+            _sampler_lifecycle(
+                str(sampling_session_id),
+                kind=kind,
+                base_model=base_model,
+                model_path=model_path,
+                model_id=model_id,
+            )
+        )
         return Sampler(
             service=self,
             sampling_session_id=str(sampling_session_id),
@@ -968,6 +1084,14 @@ class ServiceClient:
     ) -> None:
         """Record one runtime log line. Sugar over :meth:`event` with ``type="log"``.
 
+        **Use this instead of ``print`` once a session exists.** It writes the
+        web console *and* the terminal (via ``logging``, to stderr), so the two
+        never disagree; a ``print`` beside it only duplicates the terminal half
+        and leaves the console blank. Same for :meth:`metric` (numbers) and
+        :meth:`artifact` (paths you produced). ``print`` is still right before
+        there is a session -- a ``UserClient`` connectivity check -- and for
+        dumping raw sampled tokens.
+
         Args:
             message: human-readable text.
             level: ``debug`` | ``info`` | ``warning`` | ``error``.
@@ -1014,6 +1138,10 @@ class ServiceClient:
     ) -> None:
         """Record one step's metrics. Values follow the server's metric types.
 
+        This is the numeric counterpart to :meth:`log`: use it rather than
+        printing a loss, and the value reaches both the web console and the
+        terminal. See :meth:`log` on when ``print`` is still appropriate.
+
         Args:
             metrics: this step's values. ``None`` values are dropped rather
                 than sent, since a null would occupy a key without locking it.
@@ -1043,6 +1171,10 @@ class ServiceClient:
 
         Only the pointer is kept; the bytes are never fetched. ``uri`` must
         carry a scheme -- ``mint://``, ``oss://``, ``hf://``, ``https://``.
+
+        Use this rather than printing a path you just produced, so the console
+        records it too. ``save_weights_only`` and ``save_state`` already
+        register their own result, so there is no need to re-register those.
         """
         self._reporter.artifact(
             uri, type=type, name=name, version=version,
@@ -1114,7 +1246,9 @@ class ServiceClient:
             raise SessionClosedError("this ServiceClient has been closed")
         with self._async_lock:
             if self._async_transport is None:
-                self._async_transport = AsyncTransport(self._config)
+                transport = AsyncTransport(self._config)
+                transport.on_retry = self._on_retry
+                self._async_transport = transport
             if self._async_heartbeat_task is None and self._heartbeat is not None:
                 # From the first async call on, the heartbeat belongs to the
                 # event loop instead of a background thread.
@@ -1131,6 +1265,7 @@ class ServiceClient:
             return self._async_transport
 
     async def _async_heartbeat_loop(self) -> None:
+        failures = 0
         try:
             while not self._closed:
                 await asyncio.sleep(self._heartbeat_seconds)
@@ -1147,9 +1282,13 @@ class ServiceClient:
                         max_retries=1,
                         extra_headers=self._headers(),
                     )
-                except GoneError:
+                    failures = 0
+                except GoneError as exc:
+                    self._on_heartbeat_failure(exc, failures, terminal=True)
                     return
                 except Exception as exc:  # noqa: BLE001 - a heartbeat must not crash
+                    failures += 1
+                    self._on_heartbeat_failure(exc, failures, terminal=False)
                     log.warning("async session heartbeat failed: %s", exc)
         except asyncio.CancelledError:  # pragma: no cover - normal shutdown
             return
@@ -1266,8 +1405,21 @@ class ServiceClient:
         ]
         return ServerCapabilities(supported_models=models)
 
-    async def close_async(self) -> None:
-        """Async cleanup: finish the session and close both transports."""
+    async def close_async(
+        self,
+        status: str | None = None,
+        detail: str | None = None,
+    ) -> None:
+        """Async cleanup: finish the session and close both transports.
+
+        Mirrors :meth:`close` -- same ordering, same closing note. The note is
+        reported on a worker thread so it does not block the event loop.
+        """
+        closing_session = self._claim_closing_report()
+        if closing_session is not None:
+            await self._report_lifecycle_async(
+                _closing_lifecycle(closing_session, status, detail)
+            )
         with self._lock:
             if self._closed:
                 return
@@ -1304,6 +1456,110 @@ class ServiceClient:
 
     aclose = close_async
 
+    def _on_retry(
+        self,
+        *,
+        method: str,
+        path: str,
+        attempt: int,
+        max_attempts: int,
+        reason: str,
+        delay: float,
+    ) -> None:
+        """Report a request that is about to be retried.
+
+        Skipped for report-plane requests (reporting about reporting would
+        recurse) and while no session exists (there is nothing to address).
+        Terminal echo is left out on purpose: a flaky relay would otherwise
+        print on every retry; the Web timeline keeps the history.
+        """
+        if self._session_id is None or self._closed:
+            return
+        if "/report/" in path:
+            return
+        self._reporter.event(
+            "upstream.retrying",
+            level="warning",
+            message=(
+                f"retrying {method} {path} after {reason} "
+                f"(attempt {attempt}/{max_attempts}, {delay:.2f}s)"
+            ),
+            data={
+                "method": method,
+                "path": path,
+                "attempt": attempt,
+                "max_attempts": max_attempts,
+                "reason": reason,
+                "delay_seconds": round(delay, 3),
+            },
+        )
+
+    def _on_heartbeat_failure(
+        self, exc: BaseException, consecutive: int, terminal: bool
+    ) -> None:
+        """Report a failed heartbeat. ``terminal`` means the session is gone."""
+        if self._session_id is None or self._closed:
+            return
+        self._reporter.event(
+            "heartbeat.failed",
+            level="error" if terminal else "warning",
+            message=(
+                f"session heartbeat stopped: {exc}"
+                if terminal
+                else f"session heartbeat failed ({consecutive} consecutive): {exc}"
+            ),
+            data={
+                "consecutive_failures": consecutive,
+                "terminal": terminal,
+                "error": type(exc).__name__,
+            },
+        )
+
+    async def _report_event_async(
+        self, event: tuple[str, str, dict[str, Any]]
+    ) -> None:
+        """Report a structured event from an async path, off the event loop."""
+        event_type, message, details = event
+        try:
+            await asyncio.to_thread(
+                self._reporter.event, event_type, message=message, data=details
+            )
+        except Exception as exc:  # noqa: BLE001 - reporting must not break training
+            log.warning("event report failed (ignored): %s", exc)
+
+    def _claim_closing_report(self) -> str | None:
+        """Take the one ``session.closing`` report this client will make.
+
+        Runs before either close path clears the session, because the reporter
+        addresses the session by id. The flag is flipped under the lock, so
+        concurrent closes cannot both report.
+        """
+        with self._lock:
+            if self._closed or self._closing_reported:
+                return None
+            session_id = self._session_id
+            if session_id is None:
+                return None
+            self._closing_reported = True
+            return session_id
+
+    async def _report_lifecycle_async(
+        self, event: tuple[str, str, dict[str, Any]]
+    ) -> None:
+        """Report one lifecycle fact without blocking the event loop.
+
+        Reporting is a synchronous HTTP call, so the ``*_async`` twins push it
+        to a worker thread -- the same treatment ``_save_async`` gives artifact
+        reports. Failures are swallowed: reporting must not break training.
+        """
+        event_type, summary, details = event
+        try:
+            await asyncio.to_thread(
+                self._reporter.lifecycle, event_type, summary, data=details
+            )
+        except Exception as exc:  # noqa: BLE001 - reporting must not break training
+            log.warning("lifecycle report failed (ignored): %s", exc)
+
     def _create_trainer(self, path: str, body: dict[str, Any]) -> str:
         """Create a training model through the service plane.
 
@@ -1315,9 +1571,15 @@ class ServiceClient:
         request_id = self._submit_on(
             path, body, base_url=self._config.service_train_base_url
         )
-        return self.resolver(base_url=self._config.service_base_url).resolve(
+        model_id = self.resolver(base_url=self._config.service_base_url).resolve(
             request_id, timeout=None, parse=P.parse_model_id
         )
+        # Both create paths funnel through here, and only a resolved id gets
+        # this far, so one hook covers plain creates and resumes alike and a
+        # failed create reports nothing -- the rule the save hook follows.
+        event_type, summary, details = _trainer_lifecycle(model_id, body)
+        self._reporter.lifecycle(event_type, summary, data=details)
+        return model_id
 
     def _submit(self, path: str, body: dict[str, Any]) -> str:
         """Send a request that returns a bare ``request_id`` (train plane)."""
@@ -1399,11 +1661,22 @@ class ServiceClient:
         so a failure here must not mask whatever the caller was really doing.
 
         ``status`` and ``detail`` are accepted for Tinker call-shape
-        compatibility (``close("success", detail=...)``). The relay's finish
-        endpoint carries no request fields, so they are not transmitted. The
-        return value is a completed future-shaped object, so ported code that
-        calls ``close(...).result()`` also works.
+        compatibility (``close("success", detail=...)``). They are not sent to
+        the finish endpoint, but they are recorded on the ``session.closing``
+        lifecycle event. The return value is a completed future-shaped object,
+        so ported code that calls ``close(...).result()`` also works.
         """
+        # Before the id is cleared: reporting needs the session it belongs to,
+        # and this is also the only place ``status``/``detail`` are kept --
+        # the finish endpoint carries no fields, so a closing note would
+        # otherwise be dropped on the floor.
+        closing_session = self._claim_closing_report()
+        if closing_session is not None:
+            event_type, summary, closing = _closing_lifecycle(
+                closing_session, status, detail
+            )
+            self._reporter.lifecycle(event_type, summary, data=closing)
+
         with self._lock:
             if self._closed:
                 return _CompletedFuture()

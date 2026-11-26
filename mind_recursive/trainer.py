@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import warnings
 from typing import Any, Callable, Sequence
 
 from . import _protocol as P
@@ -77,14 +76,101 @@ class _ArtifactFuture(APIFuture[str]):
         return value
 
 
-#: Prefix for a training model's ephemeral sampler exports. Each
-#: save_weights_and_get_sampling_client() saves ``ephemeral-<seq>``; a named
-#: weights-only save must not use this prefix.
+class _LoadFuture(APIFuture[dict[str, Any]]):
+    """A load future that reports the completed load, once.
+
+    ``load_weights`` returns a future, so the SDK does not know the load
+    finished until the caller collects it. Reporting on the first successful
+    ``result()`` keeps the claim honest; a failed load reports nothing.
+    """
+
+    __slots__ = ("_report", "_reported")
+
+    def __init__(
+        self,
+        request_id: str,
+        resolver: FutureResolver,
+        parse: Callable[[dict[str, Any] | bytes], dict[str, Any]],
+        report: Callable[[], None],
+    ) -> None:
+        super().__init__(request_id, resolver, parse)
+        self._report = report
+        self._reported = False
+
+    def result(self, timeout: float | None = None) -> dict[str, Any]:
+        value = super().result(timeout)
+        with self._lock:
+            if self._reported:
+                return value
+            self._reported = True
+        try:
+            self._report()
+        except Exception as exc:  # noqa: BLE001 - reporting must not break a load
+            log.warning("reporting the completed load failed (ignored): %s", exc)
+        return value
+
+
+#: Prefix the SDK gives every throwaway sampler export:
+#: :meth:`LoraTrainer.save_weights_and_get_sampler` saves ``ephemeral-<seq>``,
+#: where ``seq`` counts per trainer. A named weights-only save must not use
+#: this prefix, so a weight the caller keeps can never collide with an export
+#: slot.
 EPHEMERAL_SAMPLER_NAME = "ephemeral"
 
-#: TTL of the ephemeral export. The server expires the throwaway weights after
-#: this, so a forgotten sampler does not pin storage forever.
+#: TTL the SDK sends with every throwaway sampler export, so a forgotten
+#: sampler does not pin storage forever.
 EPHEMERAL_SAMPLER_TTL_SECONDS = 86400
+
+#: Default TTL of a training-state checkpoint, sent explicitly by
+#: :meth:`LoraTrainer.save_state`: a resume path is good for 72h unless the
+#: caller asks for another lifetime. Pass ``ttl_seconds=None`` to leave the
+#: field out of the request.
+CHECKPOINT_TTL_SECONDS = 259200
+
+
+class _Unset:
+    """Sentinel: ``ttl_seconds`` not given at all.
+
+    ``None`` has to stay meaningful -- it is how a caller says "send no TTL and
+    let the server decide" -- so it cannot double as "argument omitted".
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return "<unset>"
+
+
+UNSET = _Unset()
+
+
+def _save_lifecycle(
+    path: str,
+    *,
+    name: str,
+    artifact_type: str,
+    ttl_seconds: int | None,
+) -> tuple[str, str, dict[str, Any]]:
+    """Build the event for a save that resolved to ``path``."""
+    details: dict[str, Any] = {"path": path, "name": name, "type": artifact_type}
+    label = "checkpoint" if artifact_type == "checkpoint" else "weights"
+    suffix = ""
+    if ttl_seconds is not None:
+        details["ttl_seconds"] = ttl_seconds
+        suffix = f" (ttl={ttl_seconds}s)"
+    return "save.completed", f"{label} saved: {path}{suffix}", details
+
+
+def _load_lifecycle(
+    path: str, *, optimizer: bool, model_id: str
+) -> tuple[str, str, dict[str, Any]]:
+    """Build the event for weights that finished loading."""
+    label = "weights + optimizer" if optimizer else "weights"
+    return (
+        "weights.loaded",
+        f"{label} loaded: {path}",
+        {"path": path, "optimizer": optimizer, "model_id": model_id},
+    )
 
 
 def _checkpoint_name(name: str, method: str) -> str:
@@ -420,7 +506,7 @@ class LoraTrainer:
         ):
             raise ConfigurationError(
                 f"the {EPHEMERAL_SAMPLER_NAME!r} prefix is reserved for the "
-                "ephemeral export of save_weights_and_get_sampling_client(); "
+                "ephemeral export of save_weights_and_get_sampler(); "
                 "pick another name"
             )
 
@@ -450,16 +536,26 @@ class LoraTrainer:
             body["user_metadata"] = user_metadata
         request_id = self._service._submit(endpoint, body)
         artifact_type = "checkpoint" if train_state else "sampler_weights"
-        return _ArtifactFuture(
-            request_id,
-            self._service.resolver(),
-            P.parse_weights_path,
-            lambda path: self._service.artifact(
+
+        def _report_saved(path: str) -> None:
+            self._service.artifact(
                 path,
                 type=artifact_type,
                 name=name,
                 metadata=dict(user_metadata) if user_metadata else None,
-            ),
+            )
+            event_type, message, details = _save_lifecycle(
+                path, name=name, artifact_type=artifact_type, ttl_seconds=ttl_seconds
+            )
+            # The artifact echo already covers the terminal, so this event goes
+            # to the report plane without a second line.
+            self._service._reporter.event(event_type, message=message, data=details)
+
+        return _ArtifactFuture(
+            request_id,
+            self._service.resolver(),
+            P.parse_weights_path,
+            _report_saved,
         )
 
     def save_weights_only(
@@ -497,7 +593,7 @@ class LoraTrainer:
     def save_state(
         self,
         name: str,
-        ttl_seconds: int | None = None,
+        ttl_seconds: int | None | _Unset = UNSET,
         overwrite: bool = False,
         user_metadata: dict[str, str] | None = None,
     ) -> APIFuture[str]:
@@ -510,12 +606,23 @@ class LoraTrainer:
         A weights-only path cannot: the server rejects it as a training
         source.
 
+        **A checkpoint expires.** Left alone, this sends
+        ``CHECKPOINT_TTL_SECONDS`` (72h), so a resume path is good for three
+        days, not forever.
+
+        Pass ``ttl_seconds`` to choose another lifetime, or ``None`` to leave
+        the field out of the request entirely.
+
         The other of the two saves, named as both upstreams name it.
         """
         return self._save(
             name,
             train_state=True,
-            ttl_seconds=ttl_seconds,
+            ttl_seconds=(
+                CHECKPOINT_TTL_SECONDS
+                if isinstance(ttl_seconds, _Unset)
+                else ttl_seconds
+            ),
             overwrite=overwrite,
             user_metadata=user_metadata,
         )
@@ -548,7 +655,19 @@ class LoraTrainer:
                 "type": "load_weights",
             },
         )
-        return APIFuture(request_id, self._service.resolver(), P.parse_load_weights)
+
+        def _report_loaded() -> None:
+            event_type, message, details = _load_lifecycle(
+                path, optimizer=bool(optimizer), model_id=self._model_id
+            )
+            self._service._reporter.lifecycle(event_type, message, data=details)
+
+        return _LoadFuture(
+            request_id,
+            self._service.resolver(),
+            P.parse_load_weights,
+            _report_loaded,
+        )
 
     def load_state(self, path: str) -> APIFuture[dict[str, Any]]:
         """Load the weights alone, leaving the optimizer as it is.
@@ -625,28 +744,71 @@ class LoraTrainer:
 
     def save_weights_and_get_sampler(
         self,
-        name: str,
         *,
-        ttl_seconds: int | None = None,
-        overwrite: bool = False,
-        user_metadata: dict[str, str] | None = None,
         record_stability_info: bool = False,
+        kind: SamplerKind = "snapshot",
     ) -> Any:
-        """Save weights, then open a sampler on them.
+        """Export the current weights and open a sampler on them.
 
-        Blocks on the save, because the path is the sampler's input. Returns
-        the :class:`~mind_recursive.sampler.Sampler`, not a future -- there is nothing
-        left to await by then. For weights that move with training, skip the
-        save entirely and use ``create_sampler(kind="inflight")``.
+        The export is a throwaway: the SDK names it
+        (``ephemeral-<seq>``, numbered per trainer), sends a fixed
+        ``EPHEMERAL_SAMPLER_TTL_SECONDS`` of 24h and registers nothing as a
+        user artifact. This is what an on-policy loop wants -- a sampler for
+        the weights as they are right now, with no checkpoint to name or clean
+        up.
+
+        There is deliberately no ``name`` and no ``ttl_seconds``: weights worth
+        keeping do not belong on the sampling path. To keep them, save and open
+        the sampler separately, which also gets you ``overwrite`` and
+        ``user_metadata``::
+
+            path = trainer.save_weights_only("step-100").result()
+            sampler = trainer.create_sampler(model_path=path)
+
+        Blocks on the export, because the path is the sampler's input, and
+        returns the :class:`~mind_recursive.sampler.Sampler` rather than a future.
+        ``kind="inflight"`` skips the export altogether and binds the sampler
+        to this live model, whose weights then move as training steps.
+
+        Two hops, because training and sampling are different platforms:
+
+        1. Save the weights on the training service (``/train``) under
+           ``ephemeral-<seq>``, returning a ``mint://`` path. A distinct path
+           per step is deliberate: the inference service can only sample a
+           path once it is deployed, and the platform service keeps the
+           previous step's deployment alive until the new one is ready, so the
+           two must not share a path.
+        2. Open a snapshot sampler through ``/service/sample``: the platform
+           service deploys that path, releases the previous step's temporary
+           deployment, and resolves to the sampler id.
         """
-        path = self.save_weights_only(
-            name,
-            ttl_seconds=ttl_seconds,
-            user_metadata=user_metadata,
-            overwrite=overwrite,
+        if kind == "inflight":
+            return self.create_sampler(
+                kind="inflight",
+                record_stability_info=record_stability_info,
+            )
+        if kind != "snapshot":
+            raise ValueError(f"kind must be 'snapshot' or 'inflight', got {kind!r}")
+        # Built directly rather than via save_weights_only() because that
+        # method reports a user artefact and forbids the ``ephemeral`` prefix
+        # -- both wrong for a throwaway export.
+        seq = self._next_seq()
+        body: dict[str, Any] = {
+            "model_id": self._model_id,
+            "seq_id": seq,
+            "kind": "snapshot",
+            "path": f"{EPHEMERAL_SAMPLER_NAME}-{seq}",
+            "ttl_seconds": EPHEMERAL_SAMPLER_TTL_SECONDS,
+            "type": "save_weights_for_sampler",
+        }
+        request_id = self._service._submit(P.PATH_SAVE_WEIGHTS_FOR_SAMPLER, body)
+        model_path = APIFuture(
+            request_id,
+            self._service.resolver(),
+            P.parse_weights_path,
         ).result()
         return self.create_sampler(
-            model_path=path,
+            model_path=model_path,
             record_stability_info=record_stability_info,
         )
 
@@ -674,85 +836,12 @@ class LoraTrainer:
             record_stability_info=record_stability_info,
         )
 
-    def save_weights_and_get_sampling_client(
-        self,
-        name: str | None = None,
-        retry_config: object | None = None,
-        record_stability_info: bool = False,
-        kind: SamplerKind = "snapshot",
-    ) -> Any:
-        """Snapshot the current weights into a throwaway sampler.
-
-        Two hops, because training and sampling are different platforms now:
-
-        1. Save the weights on the training service (``/train``) under a per-step name
-           ``ephemeral-<seq>``, each with a 24h TTL. A distinct path per step
-           is deliberate: the inference service can only sample a path once it is deployed,
-           and the platform service keeps the previous step's deployment alive
-           until the new one is ready, so the two must not share a path. This
-           returns a ``mint://`` path.
-        2. Open a snapshot sampler through ``/service/sample``: the platform
-           service deploys that path on the inference service, releases the previous step's
-           temporary deployment, and resolves the future to the sampler id.
-
-        The ephemeral save is not reported as a user artefact: it is a
-        throwaway, not a checkpoint the caller asked to keep.
-
-        ``name`` is deprecated and has no effect; it is ignored with a
-        ``DeprecationWarning``. For weights you want to keep, use
-        :meth:`save_weights_and_get_sampler` with a name.
-
-        ``kind='inflight'`` skips the save and binds a sampler to this live
-        model instead; it cannot be combined with ``name``.
-        """
-        if retry_config is not None:
-            raise TypeError(
-                "retry_config is not supported; set max_retries on ServiceClient"
-            )
-        if kind == "inflight":
-            if name is not None:
-                raise ValueError(
-                    "kind='inflight' saves nothing, so a name would not be used"
-                )
-            return self.create_sampler(
-                kind="inflight",
-                record_stability_info=record_stability_info,
-            )
-        if kind != "snapshot":
-            raise ValueError(f"kind must be 'snapshot' or 'inflight', got {kind!r}")
-        if name is not None:
-            warnings.warn(
-                "The 'name' parameter of save_weights_and_get_sampling_client() "
-                "has no effect: the weights are an ephemeral export. For a "
-                "persistent checkpoint use save_weights_and_get_sampler(name).",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-        # Hop 1: weights-only save on the training service under a per-step name, 24h
-        # TTL. Built directly rather than via save_weights_only() because that
-        # method reports a user artefact and forbids the ``ephemeral`` prefix
-        # -- both wrong for a throwaway export.
-        seq = self._next_seq()
-        body: dict[str, Any] = {
-            "model_id": self._model_id,
-            "seq_id": seq,
-            "kind": "snapshot",
-            "path": f"{EPHEMERAL_SAMPLER_NAME}-{seq}",
-            "ttl_seconds": EPHEMERAL_SAMPLER_TTL_SECONDS,
-            "type": "save_weights_for_sampler",
-        }
-        request_id = self._service._submit(P.PATH_SAVE_WEIGHTS_FOR_SAMPLER, body)
-        model_path = APIFuture(
-            request_id,
-            self._service.resolver(),
-            P.parse_weights_path,
-        ).result()
-        # Hop 2: deploy the saved path on the inference service and open the sampler. This
-        # goes through ``/service/sample`` and waits on the deployment.
-        return self.create_sampler(
-            model_path=model_path,
-            record_stability_info=record_stability_info,
-        )
+    #: Tinker's spelling of the ephemeral export. A real alias -- the same
+    #: function object -- so the two names cannot drift apart. ``retry_config``
+    #: is gone with the old signature: retry policy lives on the
+    #: ``ServiceClient``, and a ported call that passes it now fails loudly on
+    #: an unexpected keyword rather than having it quietly dropped.
+    save_weights_and_get_sampling_client = save_weights_and_get_sampler
 
     # -- async twins ----------------------------------------------------------
     async def forward_backward_async(
@@ -873,7 +962,7 @@ class LoraTrainer:
         ):
             raise ConfigurationError(
                 f"the {EPHEMERAL_SAMPLER_NAME!r} prefix is reserved for the "
-                "ephemeral export of save_weights_and_get_sampling_client(); "
+                "ephemeral export of save_weights_and_get_sampler(); "
                 "pick another name"
             )
         if train_state:
@@ -914,6 +1003,11 @@ class LoraTrainer:
             )
         except Exception:  # noqa: BLE001 - reporting must not fail a save
             log.warning("artifact report failed for %s (ignored)", path)
+        await self._service._report_event_async(
+            _save_lifecycle(
+                path, name=name, artifact_type=artifact_type, ttl_seconds=ttl_seconds
+            )
+        )
         return path
 
     async def save_weights_only_async(
@@ -938,15 +1032,22 @@ class LoraTrainer:
     async def save_state_async(
         self,
         name: str,
-        ttl_seconds: int | None = None,
+        ttl_seconds: int | None | _Unset = UNSET,
         overwrite: bool = False,
         user_metadata: dict[str, str] | None = None,
     ) -> str:
-        """Async twin of :meth:`save_state`."""
+        """Async twin of :meth:`save_state`.
+
+        Same default: ``CHECKPOINT_TTL_SECONDS`` unless told otherwise.
+        """
         return await self._save_async(
             name,
             train_state=True,
-            ttl_seconds=ttl_seconds,
+            ttl_seconds=(
+                CHECKPOINT_TTL_SECONDS
+                if isinstance(ttl_seconds, _Unset)
+                else ttl_seconds
+            ),
             overwrite=overwrite,
             user_metadata=user_metadata,
         )
@@ -965,9 +1066,13 @@ class LoraTrainer:
                 "type": "load_weights",
             },
         )
-        return await self._service.async_resolver().resolve(
+        value = await self._service.async_resolver().resolve(
             request_id, timeout=None, parse=P.parse_load_weights
         )
+        await self._service._report_event_async(
+            _load_lifecycle(path, optimizer=bool(optimizer), model_id=self._model_id)
+        )
+        return value
 
     async def load_state_async(self, path: str) -> dict[str, Any]:
         """Async twin of :meth:`load_state` (weights only)."""
@@ -1028,55 +1133,17 @@ class LoraTrainer:
 
     async def save_weights_and_get_sampler_async(
         self,
-        name: str,
         *,
-        ttl_seconds: int | None = None,
-        overwrite: bool = False,
-        user_metadata: dict[str, str] | None = None,
-        record_stability_info: bool = False,
-    ) -> Any:
-        """Async twin of :meth:`save_weights_and_get_sampler`."""
-        path = await self.save_weights_only_async(
-            name,
-            ttl_seconds=ttl_seconds,
-            user_metadata=user_metadata,
-            overwrite=overwrite,
-        )
-        return await self.create_sampler_async(
-            model_path=path,
-            record_stability_info=record_stability_info,
-        )
-
-    async def save_weights_and_get_sampling_client_async(
-        self,
-        name: str | None = None,
-        retry_config: object | None = None,
         record_stability_info: bool = False,
         kind: SamplerKind = "snapshot",
     ) -> Any:
-        """Async twin of :meth:`save_weights_and_get_sampling_client`."""
-        if retry_config is not None:
-            raise TypeError(
-                "retry_config is not supported; set max_retries on ServiceClient"
-            )
+        """Async twin of :meth:`save_weights_and_get_sampler`."""
         if kind == "inflight":
-            if name is not None:
-                raise ValueError(
-                    "kind='inflight' saves nothing, so a name would not be used"
-                )
             return await self.create_sampler_async(
                 kind="inflight", record_stability_info=record_stability_info
             )
         if kind != "snapshot":
             raise ValueError(f"kind must be 'snapshot' or 'inflight', got {kind!r}")
-        if name is not None:
-            warnings.warn(
-                "The 'name' parameter of save_weights_and_get_sampling_client() "
-                "has no effect: the weights are an ephemeral export. For a "
-                "persistent checkpoint use save_weights_and_get_sampler(name).",
-                DeprecationWarning,
-                stacklevel=2,
-            )
         seq = self._next_seq()
         body: dict[str, Any] = {
             "model_id": self._model_id,
@@ -1096,6 +1163,9 @@ class LoraTrainer:
             model_path=model_path,
             record_stability_info=record_stability_info,
         )
+
+    #: Async twin of the Tinker spelling. Same function object, same reasons.
+    save_weights_and_get_sampling_client_async = save_weights_and_get_sampler_async
 
     #: Upstream's spelling of the weights-only save. Same function object, so
     #: the two names cannot drift. ``save_state`` needs no alias: it is the

@@ -189,6 +189,9 @@ class FakeRelay:
     sample_texts: list[str] | None = None
     sample_tokenizer: Any = None
     fail_paths: dict[str, tuple[int, Any]] = field(default_factory=dict)
+    #: Same shape as ``fail_paths``, but each entry is consumed by the first
+    #: matching request. Used to exercise the retry path: fail once, succeed.
+    fail_once_paths: dict[str, tuple[int, Any]] = field(default_factory=dict)
     requests: list[RecordedRequest] = field(default_factory=list)
 
     _counter: int = 0
@@ -235,6 +238,12 @@ class FakeRelay:
 
         if path in self.fail_paths:
             status, payload = self.fail_paths[path]
+            if isinstance(payload, (bytes, bytearray)):
+                return httpx.Response(status, content=bytes(payload))
+            return httpx.Response(status, json=payload)
+
+        if path in self.fail_once_paths:
+            status, payload = self.fail_once_paths.pop(path)
             if isinstance(payload, (bytes, bytearray)):
                 return httpx.Response(status, content=bytes(payload))
             return httpx.Response(status, json=payload)

@@ -31,7 +31,7 @@ trainer = sc.create_lora_trainer("Qwen/Qwen3.8-27B", rank=16)
 | `optim_step(optim_params=None, *, adam_params=None)` | `APIFuture[dict]` | 应用累积的梯度；只接受 `AdamParams` |
 | `get_info()` | `ModelInfo` | 服务端对这个模型的记录；同步调用 |
 | `create_sampler(*, model_path=None, kind="snapshot", record_stability_info=False)` | `Sampler` | 从这个模型创建采样客户端 |
-| `save_weights_and_get_sampler(name, ...)` | `Sampler` | 保存权重并创建 sampler；阻塞到保存完成 |
+| `save_weights_and_get_sampler(*, record_stability_info=False, kind="snapshot")` | `Sampler` | 临时导出权重并创建 sampler；阻塞到导出完成。不接 `name`／`ttl_seconds` |
 | `save_weights_only(name, ...)` | `APIFuture[str]` | 只保存权重，见 [Checkpoint](checkpoints.md) |
 | `save_state(name, ...)` | `APIFuture[str]` | 保存权重 + 优化器状态，见 [Checkpoint](checkpoints.md) |
 | `load_weights(path, *, optimizer=True)` | `APIFuture[dict]` | 向当前模型加载权重 |
@@ -131,16 +131,18 @@ info.extra            # 未建模的服务端字段
 `get_info()` 是同步调用。所有字段都可选；缺失表示服务端没有返回，不是错误。
 
 从 checkpoint 创建 trainer 时，如果没有同时显式给出 `rank`、`train_mlp`、
-`train_attn`，`trainer.lora_config` 是 `None`。effective rank 用
-`trainer.get_info().lora_rank` 查询。见 [Checkpoint 与续训](checkpoints.md)。
+`train_attn`，`trainer.lora_config` 是 `None`，而 `get_info()` 也查不到 effective
+rank：这两个字段只反映建模请求里显式带上的值。续训不传 `rank` 时 `is_lora` 是
+`False`、`lora_rank` 是 `None`，与 checkpoint 实际存的结构无关。见
+[Checkpoint 与续训](checkpoints.md)。
 
 ## 从这里采样
 
 ```python
-# 固定权重：先保存，再采样
-sampler = trainer.save_weights_and_get_sampler("step-100")
+# 临时导出：自动命名、24 小时后过期，适合 RL 每步采样
+sampler = trainer.save_weights_and_get_sampler()
 
-# 或者分两步
+# 要留下这份权重：自己存，再开 sampler
 path = trainer.save_weights_only("step-100").result()
 sampler = trainer.create_sampler(model_path=path)
 
@@ -159,7 +161,7 @@ sampler = trainer.create_sampler(kind="inflight")
 | `save_weights_for_sampler` | `save_weights_only`（别名） |
 | `save_state` | `save_state`（参数顺序已对齐） |
 | `create_sampling_client` | `create_sampler` 的薄壳 |
-| `save_weights_and_get_sampling_client` | 临时导出（不传 `path`），直接拿到 sampling session |
+| `save_weights_and_get_sampling_client` | `save_weights_and_get_sampler` 的真别名（同一个函数对象） |
 | `load_state` | 固定 `load_weights(path, optimizer=False)` |
 | `load_state_with_optimizer` | 固定 `load_weights(path, optimizer=True)` |
 
@@ -168,18 +170,22 @@ trainer.forward(data, "cross_entropy").result()
 trainer.optim_step(tinker.types.AdamParams(learning_rate=1e-5)).result()
 trainer.save_state("step-1", 3600, False).result()
 trainer.save_weights_for_sampler("step-1", 3600).result()
-sampler = trainer.save_weights_and_get_sampling_client().result()
+sampler = trainer.save_weights_and_get_sampling_client()   # 返回 Sampler，不是 future
 ```
 
 `save_state` 在两套命名里相同。`load_state` 不是 `load_weights` 的别名：它只加载
-权重，不动优化器状态。`save_weights_and_get_sampling_client()` 是两跳（训练在
-训练和采样在两个不同的后端）：先在 `/train` 存一次权重（每步一个
-不同的名字 `ephemeral-<seq>`、24 小时 TTL），拿到 `mint://` path；再经
-`/service/sample` 由平台把这份权重部署到推理服务上并开 sampler。推理服务
-只能采样已部署的权重，所以第二跳要等一次部署，SDK 用 future 自动等待；每步一个新
-部署，新部署就绪后释放同一训练模型的上一个。临时存盘不上报 artifact。传 `name`
-不起作用，只会发 `DeprecationWarning`；要留下来的权重用
-`save_weights_and_get_sampler(name)`。见 [Tinker 迁移](tinker.md)。
+权重，不动优化器状态。
+
+`save_weights_and_get_sampling_client` 是 `save_weights_and_get_sampler` 的真别名
+（同一个函数对象），两跳（训练和采样在两个不同的后端）：先在 `/train` 存一次权重
+（SDK 自动命名 `ephemeral-<seq>`，每个 trainer 内递增，24 小时 TTL），拿到 `mint://` path；再经
+`/service/sample` 由平台把这份权重部署到推理服务上并开 sampler。推理服务只能采样
+已部署的权重，所以第二跳要等一次部署，SDK 自动等待；每步一个新部署，新部署就绪后
+释放同一训练模型的上一个。
+
+这条路径上的导出一律是用完就扔：不接 `name`、不接 `ttl_seconds`、不登记 artifact。
+**要留下来的权重用 `save_weights_only(name)`**，再用 `create_sampler(model_path=...)`。
+见 [Tinker 迁移](tinker.md)。
 
 ## 协议细节
 

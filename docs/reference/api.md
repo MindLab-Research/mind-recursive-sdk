@@ -143,7 +143,7 @@ ServiceClient(
 | `artifact(uri, *, type, name=None, version=None, description=None, metadata=None)` | `None` | 登记产物引用 |
 | `summary(mapping=None, /, **kwargs)` | `None` | 收尾标量 |
 | `require_session()` | `str` | 当前 session id；已关闭时抛 `SessionClosedError` |
-| `close(status=None, detail=None)` | 完成态 future-like | 停心跳、结束 session、关闭连接；`status` / `detail` 只为兼容上游签名 |
+| `close(status=None, detail=None)` | 完成态 future-like | 停心跳、结束 session、关闭连接；`status` / `detail` 记入 `session.closing` 事件 |
 
 属性：`session_id`、`name`、`client_id`、`config`、`client_config`、`transport`。
 
@@ -169,16 +169,16 @@ Tinker 拼写：
 | `forward_backward(data, loss_fn="cross_entropy", loss_fn_config=None, *, forward_only=False)` | `APIFuture[ForwardBackwardOutput]` | 前向 + 反向 |
 | `forward(data, loss_fn="cross_entropy", loss_fn_config=None)` | `APIFuture[ForwardBackwardOutput]` | Tinker 拼写；`forward_only=True` |
 | `optim_step(optim_params=None, *, adam_params=None)` | `APIFuture[dict[str, Any]]` | 应用梯度；只接受 `AdamParams` |
-| `save_weights_only(name, ttl_seconds=None, user_metadata=None, *, overwrite=False)` | `APIFuture[str]` | 持久保存权重到 `adapters/`；`ephemeral` 是保留名 |
-| `save_state(name, ttl_seconds=None, overwrite=False, user_metadata=None)` | `APIFuture[str]` | 保存权重 + 优化器到 `checkpoints/` |
+| `save_weights_only(name, ttl_seconds=None, user_metadata=None, *, overwrite=False)` | `APIFuture[str]` | 持久保存权重到 `adapters/`；默认不带 TTL；`ephemeral` 前缀保留给临时导出 |
+| `save_state(name, ttl_seconds=None, overwrite=False, user_metadata=None)` | `APIFuture[str]` | 保存权重 + 优化器到 `checkpoints/`；默认带 72h TTL |
 | `load_weights(path, *, optimizer=True)` | `APIFuture[dict[str, Any]]` | 向当前模型加载权重 |
 | `load_state(path)` | `APIFuture[dict[str, Any]]` | 只加载权重 |
 | `load_state_with_optimizer(path)` | `APIFuture[dict[str, Any]]` | 加载权重 + 优化器 |
 | `get_info()` | `ModelInfo` | 服务端模型记录；同步 |
 | `create_sampler(*, model_path=None, kind="snapshot", record_stability_info=False)` | `Sampler` | 从当前模型创建 sampler |
-| `save_weights_and_get_sampler(name, *, ttl_seconds=None, overwrite=False, user_metadata=None, record_stability_info=False)` | `Sampler` | 保存权重并创建 sampler |
+| `save_weights_and_get_sampler(*, record_stability_info=False, kind="snapshot")` | `Sampler` | 临时导出权重并创建 sampler；自动命名 `ephemeral-<seq>`（每个 trainer 内递增）、固定 24h TTL、不登记 artifact。不接 `name`／`ttl_seconds` |
 | `create_sampling_client(model_path=None, retry_config=None, record_stability_info=False, *, kind="snapshot")` | `Sampler` | Tinker 薄壳；`retry_config` 会被拒绝 |
-| `save_weights_and_get_sampling_client(name=None, retry_config=None, record_stability_info=False, kind="snapshot")` | `Sampler` | Tinker 形状；两跳临时导出：`/train` 存 `ephemeral` 拿 path，再 `/sample` 开 sampler；`name` 被忽略并告警 |
+| `save_weights_and_get_sampling_client` | `Sampler` | Tinker 拼法，`save_weights_and_get_sampler` 的真别名（同一个函数对象） |
 | `result()` | `LoraTrainer` | 兼容壳，返回自身 |
 
 属性：`model_id`、`base_model`、`lora_config`、`session_id`。

@@ -19,17 +19,21 @@ sampling surface. The shells are deliberately thin:
   ``result()`` (returning itself) so upstream's ``create_...(...).result()``
   style works;
 * ``close(status, detail)`` accepts the upstream call shape and returns a
-  completed future-shaped object -- the relay's finish endpoint carries no
-  fields, so the reason is not transmitted;
+  completed future-shaped object; the two arguments are recorded on the
+  ``session.closing`` lifecycle event;
 * ``TrainingClient.forward``, ``optim_step(optim_params=...)``,
   ``Sampler.compute_logprobs`` and positional ``save_state`` /
   ``save_weights_for_sampler`` / ``create_sampling_client`` are supported as
   shells over the native implementation;
-* ``save_weights_and_get_sampling_client()`` is an ephemeral export, as
-  upstream: no ``path`` is sent, the server overwrites one fixed
-  ``ephemeral`` copy per training model (24h TTL), and
-  ``name`` is ignored with a ``DeprecationWarning``. ``kind='inflight'`` skips
-  the export.
+* ``save_weights_and_get_sampling_client()`` is a real alias of
+  :meth:`~mind_recursive.LoraTrainer.save_weights_and_get_sampler` -- the same
+  function object. The export is ephemeral, as upstream: the SDK names it
+  ``ephemeral-<seq>`` (numbered per trainer), sends a fixed 24h TTL and
+  never registers it as an artifact. It takes neither ``name`` nor
+  ``ttl_seconds`` nor ``retry_config``, so an upstream call passing any of
+  them raises ``TypeError`` instead of having it silently dropped; weights
+  worth keeping go through ``save_weights_only(name)`` and
+  ``create_sampler(model_path=...)``. ``kind='inflight'`` skips the export.
 
 The save surface matches upstream's shape -- two named saves rather than one
 with a boolean: :meth:`~mind_recursive.LoraTrainer.save_weights_only` (weights alone,

@@ -202,7 +202,15 @@ class TestRecipesRun:
             for event in json.loads(item.content)["events"]
         ]
         # 正常路径只走 log；event 留给跨侧交互（比如 run.failed），不该拿来讲进度。
-        assert {event["type"] for event in events} == {"log"}
+        # SDK 自动登记的生命周期事实（trainer.created 等）是离散事件而非进度，
+        # 不由 recipe 发出，所以这里只看 recipe 自己写了什么。
+        LIFECYCLE = {
+            "session.created", "trainer.created", "trainer.resumed",
+            "sampler.created", "save.completed", "weights.loaded",
+            "upstream.retrying", "heartbeat.failed", "session.closing",
+        }
+        authored = {event["type"] for event in events} - LIFECYCLE
+        assert authored == {"log"}
         log_messages = [event.get("message", "") for event in events]
         assert any("SFT started" in message for message in log_messages)
         assert any("step 2/2" in message for message in log_messages)

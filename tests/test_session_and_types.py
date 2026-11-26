@@ -106,6 +106,52 @@ class TestHeartbeat:
         assert isinstance(heartbeat.terminal_error, GoneError)
         heartbeat.stop()
 
+    def test_failure_hook_sees_the_consecutive_count(self):
+        failures = []
+
+        def beat():
+            raise RuntimeError("network hiccup")
+
+        heartbeat = Heartbeat(
+            beat,
+            interval=0.01,
+            on_failure=lambda exc, count, terminal: failures.append(
+                (type(exc).__name__, count, terminal)
+            ),
+        )
+        heartbeat.start()
+        time.sleep(0.05)
+        heartbeat.stop()
+
+        assert failures
+        assert failures[0] == ("RuntimeError", 1, False)
+        assert all(terminal is False for _, _, terminal in failures)
+        assert [count for _, count, _ in failures] == list(
+            range(1, len(failures) + 1)
+        )
+
+    def test_a_terminal_failure_is_flagged_to_the_hook(self):
+        from mind_recursive._errors import GoneError
+
+        seen = []
+
+        def beat():
+            raise GoneError("session reclaimed")
+
+        heartbeat = Heartbeat(
+            beat,
+            interval=0.01,
+            stop_on=(GoneError,),
+            on_failure=lambda exc, count, terminal: seen.append(
+                (type(exc).__name__, terminal)
+            ),
+        )
+        heartbeat.start()
+        time.sleep(0.05)
+        heartbeat.stop()
+
+        assert seen == [("GoneError", True)]
+
     def test_failure_count_resets_after_success(self):
         state = {"n": 0}
 

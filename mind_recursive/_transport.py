@@ -26,7 +26,7 @@ import json
 import logging
 import random
 import time
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 import httpx
 
@@ -83,6 +83,35 @@ class Transport:
         self._user_agent = user_agent or "mind-recursive-python"
         self._clients: dict[str, httpx.Client] = {}
         self._closed = False
+        #: Called just before a retry sleeps. Reporting uses this to record
+        #: ``upstream.retrying``; the hook is best-effort by construction, so a
+        #: hook that raises never changes the request's outcome.
+        self.on_retry: Callable[..., None] | None = None
+
+    def _notify_retry(
+        self,
+        method: str,
+        path: str,
+        attempt: int,
+        max_attempts: int,
+        reason: str,
+        delay: float,
+    ) -> None:
+        """Tell a caller-supplied hook that this request is about to retry."""
+        callback = self.on_retry
+        if callback is None:
+            return
+        try:
+            callback(
+                method=method,
+                path=path,
+                attempt=attempt,
+                max_attempts=max_attempts,
+                reason=reason,
+                delay=delay,
+            )
+        except Exception:  # noqa: BLE001 - reporting must not break a request
+            log.debug("retry hook failed (ignored)", exc_info=True)
 
     # -- headers --------------------------------------------------------------
     def _base_headers(self) -> dict[str, str]:
@@ -221,13 +250,23 @@ class Transport:
                         "retrying %s %s after status %s in %.2fs (attempt %d/%d)",
                         method, path, response.status_code, delay, attempt + 1, budget,
                     )
+                    self._notify_retry(
+                        method, path, attempt + 1, budget,
+                        f"HTTP {response.status_code}", delay,
+                    )
                     response.close()
                     time.sleep(delay)
                     continue
                 raise self._to_error(response, method, path)
 
             # Transport fault with budget remaining.
-            time.sleep(_backoff_delay(attempt))
+            delay = _backoff_delay(attempt)
+            self._notify_retry(
+                method, path, attempt + 1, budget,
+                type(last_error).__name__ if last_error else "transport error",
+                delay,
+            )
+            time.sleep(delay)
 
         raise last_error or APIError(f"{method} {path} exhausted its retry budget", path=path)
 
@@ -406,12 +445,22 @@ class AsyncTransport(Transport):
                         "retrying %s %s after status %s in %.2fs (attempt %d/%d)",
                         method, path, response.status_code, delay, attempt + 1, budget,
                     )
+                    self._notify_retry(
+                        method, path, attempt + 1, budget,
+                        f"HTTP {response.status_code}", delay,
+                    )
                     await response.aclose()
                     await asyncio.sleep(delay)
                     continue
                 raise self._to_error(response, method, path)
 
-            await asyncio.sleep(_backoff_delay(attempt))
+            delay = _backoff_delay(attempt)
+            self._notify_retry(
+                method, path, attempt + 1, budget,
+                type(last_error).__name__ if last_error else "transport error",
+                delay,
+            )
+            await asyncio.sleep(delay)
 
         raise last_error or APIError(f"{method} {path} exhausted its retry budget", path=path)
 

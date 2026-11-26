@@ -1,6 +1,6 @@
 [project]
 name = "mind-recursive"
-version = "0.1.0"
+version = "0.1.1"
 description = "Python SDK for the Mind Recursive platform: custom training loops, managed training, deployment and inference"
 readme = "README.md"
 requires-python = ">=3.11"

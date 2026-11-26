@@ -77,6 +77,11 @@ def _echo_artifact(uri: str, artifact_type: str, name: str | None) -> None:
     suffix = f" (name={name})" if name else ""
     emit(f"artifact {artifact_type}: {uri}{suffix}")
 
+
+def _echo_lifecycle(message: str) -> None:
+    """Echo a lifecycle fact. No prefix: these read as plain status lines."""
+    emit(message)
+
 #: Upstream limits, enforced here so a shape that the reporting service would
 #: reject does not pass silently. Sources: event field caps in
 #: ``internal/biz/biz_execution/report_events.go:26-40``; the artifact byte cap
@@ -150,6 +155,30 @@ class Reporter:
             self.event("log", level=level, message=message, step=step)
         except Exception as exc:  # noqa: BLE001 - reporting must not break training
             log.warning("reporter.log failed (ignored): %s", exc)
+
+    def lifecycle(
+        self,
+        type: str,  # noqa: A002 - matches the field name on the wire
+        message: str,
+        *,
+        data: dict[str, Any] | None = None,
+    ) -> None:
+        """Record a lifecycle fact the SDK knows without being told.
+
+        Creating a trainer, resuming from a checkpoint and closing a session
+        are facts about the run, not user actions, in exactly the sense that
+        a saved artifact is: the SDK already holds the ids, so requiring the
+        caller to restate them is an invitation to forget -- and a session
+        whose console shows no trainer and no resume is harder to read than
+        one that shows both. These go out as structured ``event`` entries
+        rather than ``log`` lines so they stay filterable and never look like
+        something the user wrote.
+
+        Best-effort twice over: ``event`` already swallows its own failures,
+        and the terminal echo cannot raise.
+        """
+        _echo_lifecycle(message)
+        self.event(type, message=message, data=data)
 
     def event(
         self,

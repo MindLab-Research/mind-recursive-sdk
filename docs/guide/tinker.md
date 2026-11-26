@@ -37,7 +37,7 @@ from mind_recursive import tinker
 | `create_training_client_from_state` | `create_lora_trainer_from_state`（薄壳） |
 | `create_training_client_from_state_with_optimizer` | 同上的 `load_optimizer=True` |
 | `get_server_capabilities()` / `_async()` | 兼容命名空间上的同名方法；原生 `ServiceClient` 只有 async 版 |
-| `close(status, detail)` | `close()`（接受参数，但不发给服务端） |
+| `close(status, detail)` | `close()`（参数记入 `session.closing` 事件） |
 
 `mind_recursive.tinker.ServiceClient` 是原生 `ServiceClient` 的子类，只额外补了
 `get_server_capabilities` 这两个 Tinker 专属查询；其余方法都直接继承，所以两个命名空间
@@ -55,7 +55,7 @@ from mind_recursive import tinker
 | `load_state` | `load_state`（只加载权重） |
 | `load_state_with_optimizer` | `load_state_with_optimizer` |
 | `create_sampling_client` | `create_sampler` 的薄壳 |
-| `save_weights_and_get_sampling_client` | 临时导出两跳：`/train` 存 `ephemeral-<seq>` 拿 path，再经 `/service/sample` 部署并开 sampler |
+| `save_weights_and_get_sampling_client` | `save_weights_and_get_sampler` 的真别名；临时导出两跳：`/train` 存 `ephemeral-<seq>` 拿 path，再经 `/service/sample` 部署并开 sampler |
 
 `SamplingClient` 上：
 
@@ -101,13 +101,17 @@ sc.close("success", detail="training complete").result()
   同时有 `.path` 属性，所以上游 `result().path` 的写法也能用。
 - `sample` 的 `num_samples`、`sampling_params` 是位置参数，和上游一致；
   `include_prompt_logprobs` 是 `prompt_logprobs` 的上游拼写，二选一即可。
-- `save_weights_and_get_sampling_client()` 是临时导出，走两跳（训练和采样是两个
-  平台）：先在 `/train` 存一次权重拿 `mint://` path（每步一个不同的名字
-  `ephemeral-<seq>`、24h TTL），再经 `/service/sample` 由平台把这份
-  权重部署到推理服务上并开 sampler。推理服务只能采样已部署的权重，所以第二跳要等一次
-  部署，SDK 用 future 自动等待；每步一个新部署，新部署就绪后释放上一个。临时存盘
-  不上报 artifact。持久保存不能用 `ephemeral` 前缀。`name` 被忽略并发
-  `DeprecationWarning`；`kind="inflight"` 跳过导出直接绑活模型，同样经 `/service/sample`。
+- `save_weights_and_get_sampling_client()` 是 `save_weights_and_get_sampler` 的真
+  别名（同一个函数对象），临时导出走两跳（训练和采样是两个平台）：先在 `/train` 存
+  一次权重拿 `mint://` path（SDK 自动命名 `ephemeral-<seq>`，每个 trainer 内递增，
+  24h TTL），再经
+  `/service/sample` 由平台把这份权重部署到推理服务上并开 sampler。推理服务只能采样
+  已部署的权重，所以第二跳要等一次部署，SDK 自动等待；每步一个新部署，新部署就绪后
+  释放上一个。临时存盘不上报 artifact。持久保存不能用 `ephemeral` 前缀。
+- 这个方法**不接 `name`、`ttl_seconds` 或 `retry_config`**，上游传这些参数的调用会
+  抛 `TypeError`。上游用 `name` 想留下的权重，在这里走 `save_weights_only(name)`
+  再 `create_sampler(model_path=...)`。`kind="inflight"` 跳过导出直接绑活模型，
+  同样经 `/service/sample`。
 
 ## 没有覆盖的部分
 
@@ -170,8 +174,8 @@ except mr.MindRecursiveError:
 
 ### `close` 的 status/detail
 
-`close("success", detail="...")` 的签名保留，但服务端的 finish 端点没有请求字段，
-所以 `status` / `detail` 不会发送。session 仍会被正常结束。
+`close("success", detail="...")` 的签名保留；`status` / `detail` 不会发给 finish
+端点，而是记入 `session.closing` 生命周期事件。session 仍会被正常结束。
 
 ## 迁移检查清单
 

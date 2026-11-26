@@ -271,9 +271,12 @@ class TestTrainingStep:
         path = future.result()
         future.result()  # cached: the artifact must not be reported twice
 
-        assert len(records) == 1
-        kind, body = records[0]
-        assert kind == "artifact"
+        # Lifecycle events share this channel, so count artifacts only: the
+        # claim under test is that one save reports one artifact, twice-called
+        # future included.
+        artifacts = [item for item in records if item[0] == "artifact"]
+        assert len(artifacts) == 1
+        kind, body = artifacts[0]
         assert body["uri"] == path
         assert body["type"] == "sampler_weights"
         assert body["name"] == "sampler-001"
@@ -288,8 +291,88 @@ class TestTrainingStep:
 
         path = tc.save_state("state-001").result()
 
-        assert [(kind, body["type"], body["uri"]) for kind, body in records] == [
-            ("artifact", "checkpoint", path)
+        assert [
+            (kind, body["type"], body["uri"])
+            for kind, body in records
+            if kind == "artifact"
+        ] == [("artifact", "checkpoint", path)]
+
+    def test_creating_a_trainer_registers_it(self, service, relay, monkeypatch):
+        """The SDK holds the ids, so the console should not depend on the caller."""
+        records: list[tuple[str, dict]] = []
+        monkeypatch.setattr(
+            service._reporter, "_record", lambda kind, body: records.append((kind, body))
+        )
+        tc = service.create_lora_trainer(base_model="Qwen/Qwen3.8-27B", rank=16)
+
+        events = [body for kind, body in records if kind == "event"]
+        assert [event["type"] for event in events] == ["trainer.created"]
+        assert events[0]["data"] == {
+            "model_id": tc._model_id,
+            "base_model": "Qwen/Qwen3.8-27B",
+            "rank": 16,
+        }
+
+    def test_resuming_registers_the_checkpoint_it_came_from(
+        self, service, relay, monkeypatch
+    ):
+        """A resume is worth telling apart from a fresh create, with its source."""
+        records: list[tuple[str, dict]] = []
+        monkeypatch.setattr(
+            service._reporter, "_record", lambda kind, body: records.append((kind, body))
+        )
+        state = "mint://run-abc/checkpoints/step-3"
+        service.create_lora_trainer_from_state(
+            state, base_model="Qwen/Qwen3.8-27B", load_optimizer=True
+        )
+
+        events = [body for kind, body in records if kind == "event"]
+        assert [event["type"] for event in events] == ["trainer.resumed"]
+        assert events[0]["data"]["state_path"] == state
+        assert events[0]["data"]["load_optimizer"] is True
+
+    def test_a_failed_create_registers_nothing(self, service, relay, monkeypatch):
+        """Same rule as a failed save: no resolved id, no claim that it exists."""
+        records: list[tuple[str, dict]] = []
+        monkeypatch.setattr(
+            service._reporter, "_record", lambda kind, body: records.append((kind, body))
+        )
+        monkeypatch.setattr(
+            service,
+            "_submit_on",
+            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("create refused")),
+        )
+        with pytest.raises(RuntimeError):
+            service.create_lora_trainer(base_model="Qwen/Qwen3.8-27B")
+
+        assert [body["type"] for kind, body in records if kind == "event"] == []
+
+    def test_closing_records_the_status_the_wire_drops(
+        self, service, relay, monkeypatch
+    ):
+        """``close(status=...)`` is not transmitted, so the console is its only home."""
+        records: list[tuple[str, dict]] = []
+        monkeypatch.setattr(
+            service._reporter, "_record", lambda kind, body: records.append((kind, body))
+        )
+        service.close("success", detail="all 3 steps done")
+
+        events = [body for kind, body in records if kind == "event"]
+        assert [event["type"] for event in events] == ["session.closing"]
+        assert events[0]["data"]["status"] == "success"
+        assert events[0]["data"]["detail"] == "all 3 steps done"
+
+    def test_closing_twice_records_once(self, service, relay, monkeypatch):
+        """Idempotent close must not double-report."""
+        records: list[tuple[str, dict]] = []
+        monkeypatch.setattr(
+            service._reporter, "_record", lambda kind, body: records.append((kind, body))
+        )
+        service.close()
+        service.close()
+
+        assert [body["type"] for kind, body in records if kind == "event"] == [
+            "session.closing"
         ]
 
     @pytest.mark.parametrize(
@@ -334,14 +417,81 @@ class TestTrainingStep:
         sent = [r.json() for r in relay.requests_to(f"{TRAIN}/save_weights_for_sampler")]
         assert [b["overwrite"] for b in sent] == [False, True]
 
+    def test_save_state_sends_the_72h_default(self, service, relay):
+        """A resume path is good for three days, and the number travels."""
+        tc = service.create_lora_trainer(base_model="Qwen/Qwen3.8-27B")
+
+        tc.save_state("step-3").result()
+
+        body = relay.last(f"{TRAIN}/save_weights").json()
+        assert body["ttl_seconds"] == 259200
+
+    def test_save_state_takes_an_explicit_ttl(self, service, relay):
+        tc = service.create_lora_trainer(base_model="Qwen/Qwen3.8-27B")
+
+        tc.save_state("step-3", ttl_seconds=600).result()
+
+        assert relay.last(f"{TRAIN}/save_weights").json()["ttl_seconds"] == 600
+
+    def test_save_state_none_follows_the_server(self, service, relay):
+        """``None`` still means "send no TTL" -- the sentinel keeps it usable."""
+        tc = service.create_lora_trainer(base_model="Qwen/Qwen3.8-27B")
+
+        tc.save_state("step-3", ttl_seconds=None).result()
+
+        assert "ttl_seconds" not in relay.last(f"{TRAIN}/save_weights").json()
+
+    def test_weights_only_still_omits_the_ttl_by_default(self, service, relay):
+        """The 72h default is the checkpoint's, not every save's."""
+        tc = service.create_lora_trainer(base_model="Qwen/Qwen3.8-27B")
+
+        tc.save_weights_only("step-3").result()
+
+        body = relay.last(f"{TRAIN}/save_weights_for_sampler").json()
+        assert "ttl_seconds" not in body
+
+    def test_the_sampling_save_is_always_a_throwaway(self, service, relay, monkeypatch):
+        """Keeping weights is save_weights_only's job, not the sampler path's.
+
+        The export carries the fixed ephemeral TTL and registers no artifact,
+        so a caller cannot accidentally keep weights through this route.
+        """
+        records: list[tuple[str, dict]] = []
+        monkeypatch.setattr(
+            service._reporter, "_record", lambda kind, body: records.append((kind, body))
+        )
+        tc = service.create_lora_trainer(base_model="Qwen/Qwen3.8-27B")
+
+        tc.save_weights_and_get_sampler()
+
+        body = relay.last(f"{TRAIN}/save_weights_for_sampler").json()
+        assert body["path"].startswith("ephemeral-")
+        assert body["ttl_seconds"] == 86400
+        assert "overwrite" not in body
+        assert [kind for kind, _ in records if kind == "artifact"] == []
+
+    def test_the_sampling_save_takes_no_name_or_ttl(self, service):
+        """The signature is the contract: no name, no ttl, no overwrite."""
+        tc = service.create_lora_trainer(base_model="Qwen/Qwen3.8-27B")
+
+        for call in (
+            lambda: tc.save_weights_and_get_sampler("step-1"),
+            lambda: tc.save_weights_and_get_sampler(ttl_seconds=60),
+            lambda: tc.save_weights_and_get_sampler(overwrite=True),
+            lambda: tc.save_weights_and_get_sampler(user_metadata={"a": "b"}),
+        ):
+            with pytest.raises(TypeError):
+                call()
+
     def test_weights_only_rejects_the_reserved_ephemeral_name(self, service, relay):
         """The server keeps each model's ephemeral export under ``ephemeral``."""
         tc = service.create_lora_trainer(base_model="Qwen/Qwen3.8-27B")
 
+        # save_weights_and_get_sampler is not in this list: it takes no name
+        # at all now, so the reserved prefix is unreachable through it.
         for save in (
             lambda: tc.save_weights_only("ephemeral"),
             lambda: tc.save_weights_for_sampler("ephemeral"),
-            lambda: tc.save_weights_and_get_sampler("ephemeral"),
         ):
             with pytest.raises(mind_recursive.ConfigurationError, match="reserved"):
                 save()
@@ -556,3 +706,74 @@ class TestSampling:
     def test_sampling_needs_a_target(self, service):
         with pytest.raises(ValueError):
             service.create_sampler()
+
+
+def _record_events(service, monkeypatch) -> list[tuple[str, dict]]:
+    records: list[tuple[str, dict]] = []
+    monkeypatch.setattr(
+        service._reporter, "_record", lambda kind, body: records.append((kind, body))
+    )
+    return records
+
+
+def test_a_successful_save_reports_completion(service, relay, monkeypatch):
+    """A save future reports ``save.completed`` once it actually resolves."""
+    records = _record_events(service, monkeypatch)
+    trainer = service.create_lora_trainer(base_model="Qwen/Qwen3.8-27B")
+    records.clear()
+
+    path = trainer.save_state("state-1").result()
+
+    events = [body for kind, body in records if kind == "event"]
+    assert [event["type"] for event in events] == ["save.completed"]
+    assert events[0]["data"] == {
+        "path": path,
+        "name": "state-1",
+        "type": "checkpoint",
+        "ttl_seconds": 259200,
+    }
+
+
+def test_a_weights_only_save_completion_omits_the_ttl(service, relay, monkeypatch):
+    records = _record_events(service, monkeypatch)
+    trainer = service.create_lora_trainer(base_model="Qwen/Qwen3.8-27B")
+    records.clear()
+
+    path = trainer.save_weights_only("weights-1").result()
+
+    events = [body for kind, body in records if kind == "event"]
+    assert [event["type"] for event in events] == ["save.completed"]
+    assert events[0]["data"] == {
+        "path": path,
+        "name": "weights-1",
+        "type": "sampler_weights",
+    }
+
+
+def test_a_failed_save_reports_no_completion(service, relay, monkeypatch):
+    records = _record_events(service, monkeypatch)
+    relay.fail_paths[f"{TRAIN}/save_weights"] = (400, {"error": "rejected"})
+    trainer = service.create_lora_trainer(base_model="Qwen/Qwen3.8-27B")
+    records.clear()
+
+    with pytest.raises(Exception):
+        trainer.save_state("state-1").result()
+
+    assert [body for kind, body in records if kind == "event"] == []
+
+
+def test_loading_reports_completion(service, relay, monkeypatch):
+    records = _record_events(service, monkeypatch)
+    trainer = service.create_lora_trainer(base_model="Qwen/Qwen3.8-27B")
+    path = trainer.save_weights_only("weights-1").result()
+    records.clear()
+
+    trainer.load_weights(path, optimizer=False).result()
+
+    events = [body for kind, body in records if kind == "event"]
+    assert [event["type"] for event in events] == ["weights.loaded"]
+    assert events[0]["data"] == {
+        "path": path,
+        "optimizer": False,
+        "model_id": trainer.model_id,
+    }

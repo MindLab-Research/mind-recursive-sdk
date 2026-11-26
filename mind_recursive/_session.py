@@ -144,6 +144,7 @@ class Heartbeat:
         interval: float = DEFAULT_HEARTBEAT_SECONDS,
         name: str = "mind-recursive-heartbeat",
         stop_on: tuple[type[BaseException], ...] = (),
+        on_failure: Callable[[BaseException, int, bool], None] | None = None,
     ) -> None:
         if not (interval > 0) or interval != interval or interval == float("inf"):
             raise ValueError(f"heartbeat interval must be a finite positive number, got {interval!r}")
@@ -151,10 +152,23 @@ class Heartbeat:
         self._interval = interval
         self._name = name
         self._stop_on = stop_on
+        self._on_failure = on_failure
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._consecutive_failures = 0
         self._terminal_error: BaseException | None = None
+
+    def _notify_failure(
+        self, exc: BaseException, consecutive: int, *, terminal: bool
+    ) -> None:
+        """Tell the caller's hook that a beat failed. Best-effort."""
+        callback = self._on_failure
+        if callback is None:
+            return
+        try:
+            callback(exc, consecutive, terminal)
+        except Exception:  # noqa: BLE001 - a heartbeat must not crash on reporting
+            log.debug("heartbeat failure hook failed (ignored)", exc_info=True)
 
     def start(self) -> None:
         """Start beating. Idempotent."""
@@ -173,9 +187,13 @@ class Heartbeat:
             except Exception as exc:  # noqa: BLE001 - a heartbeat must not crash
                 if self._stop_on and isinstance(exc, self._stop_on):
                     self._terminal_error = exc
+                    self._notify_failure(
+                        exc, self._consecutive_failures, terminal=True
+                    )
                     log.info("session heartbeat stopped: %s", exc)
                     return
                 self._consecutive_failures += 1
+                self._notify_failure(exc, self._consecutive_failures, terminal=False)
                 log.warning(
                     "session heartbeat failed (%d consecutive): %s",
                     self._consecutive_failures,

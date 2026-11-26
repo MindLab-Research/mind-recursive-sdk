@@ -10,6 +10,7 @@ chat, finish.
 
 from __future__ import annotations
 
+import json
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -132,14 +133,28 @@ def test_full_run_over_real_sockets(live_relay):
         assert "x-mind_recursive-client-id" not in request.headers
 
     # Reports go to the report plane over the same socket. This run called
-    # metric / artifact / summary; it did not log an event.
+    # metric / artifact / summary; the events it did not author itself are the
+    # lifecycle facts the SDK registers on its own.
     for suffix in ("log", "artifact", "summary"):
         assert relay.requests_to(
             f"/api/mindrsi/v1/service/report/sess-0001/{suffix}"
         )
-    assert not relay.requests_to(
-        "/api/mindrsi/v1/service/report/sess-0001/events"
-    )
+    event_types = {
+        event["type"]
+        for item in relay.requests_to("/api/mindrsi/v1/service/report/sess-0001/events")
+        for event in json.loads(item.content)["events"]
+    }
+    # This run creates one trainer, opens one sampler and closes the session,
+    # so exactly these three lifecycle facts should have arrived -- no more
+    # (nothing user-authored) and no fewer (an empty set would pass a subset
+    # check while reporting was broken).
+    assert event_types == {
+        "session.created",
+        "trainer.created",
+        "save.completed",
+        "sampler.created",
+        "session.closing",
+    }
 
 
     # The session lifecycle is the ServiceClient's job, not the reporter's.

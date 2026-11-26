@@ -76,7 +76,8 @@ class TestHttpSink:
         service.artifact("mint://x", type="sampler_weights")
         service.summary(final_loss=0.1)
 
-        assert relay.count("/api/mindrsi/v1/service/report/sess-0001/events") == 1
+        # One session.created event from construction, one log event here.
+        assert relay.count("/api/mindrsi/v1/service/report/sess-0001/events") == 2
         assert relay.count("/api/mindrsi/v1/service/report/sess-0001/log") == 1
         assert relay.count("/api/mindrsi/v1/service/report/sess-0001/artifact") == 1
         assert relay.count("/api/mindrsi/v1/service/report/sess-0001/summary") == 1
@@ -86,16 +87,21 @@ class TestHttpSink:
         service.event("custom", message="two")
 
         sent = relay.requests_to("/api/mindrsi/v1/service/report/sess-0001/events")
-        assert len(sent) == 2
+        assert len(sent) == 3
         bodies = [json.loads(item.content)["events"][0] for item in sent]
-        assert [body["type"] for body in bodies] == ["log", "custom"]
+        assert [body["type"] for body in bodies] == [
+            "session.created",
+            "log",
+            "custom",
+        ]
 
     def test_a_report_is_written_into_the_session_that_exists(self, service, relay):
         """A report belongs to a session, so there is nowhere else to put it."""
         service.log("hi")
         assert service.session_id == "sess-0001"
         assert relay.count("/api/mindrsi/v1/service/session/create") == 1
-        assert relay.count("/api/mindrsi/v1/service/report/sess-0001/events") == 1
+        # session.created + this log.
+        assert relay.count("/api/mindrsi/v1/service/report/sess-0001/events") == 2
 
     def test_reporting_after_close_is_swallowed(self, service, relay, caplog):
         """Closing finishes the session, so there is no longer a target.
@@ -128,13 +134,14 @@ class TestLog:
         assert event["level"] == "warning"
         assert event["message"] == "epoch 1 step 2 loss 0.42"
         assert event["step"] == 2
-        assert event["seq"] == 1
+        # The session.created event took sequence 1 at construction.
+        assert event["seq"] == 2
         assert event["id"]
 
     def test_log_seq_increments(self, service, recorded):
         service.log("one")
         service.log("two")
-        assert [body["seq"] for _, body in recorded] == [1, 2]
+        assert [body["seq"] for _, body in recorded] == [2, 3]
 
     def test_invalid_level_falls_back_to_info(self, service, recorded):
         service.log("hi", level="catastrophic")
@@ -166,7 +173,8 @@ class TestEvent:
         assert event["message"] == "backing off"
         assert event["data"] == {"retry": 1}
         assert event["step"] == 3
-        assert event["seq"] == 1
+        # The session.created event took sequence 1 at construction.
+        assert event["seq"] == 2
         assert event["id"]
 
     def test_log_and_event_share_the_sequence(self, service, recorded):
@@ -174,7 +182,7 @@ class TestEvent:
         service.event("custom", message="two")
         bodies = [body for _, body in recorded]
         assert [e["type"] for e in bodies] == ["log", "custom"]
-        assert [e["seq"] for e in bodies] == [1, 2]
+        assert [e["seq"] for e in bodies] == [2, 3]
 
     def test_invalid_level_falls_back_to_info(self, service, recorded):
         service.event("x", level="catastrophic", message="hi")
@@ -330,3 +338,41 @@ class TestTerminalEcho:
         with caplog.at_level(logging.INFO, logger="mind_recursive"):
             service.artifact("no-scheme", type="sampler_weights")
         assert "artifact sampler_weights: no-scheme" not in caplog.text
+
+
+class TestAutomaticEvents:
+    def test_session_created_is_reported_at_construction(self, relay):
+        """The timeline starts at the session, not at the first trainer."""
+        client = build_service(relay, api_key="sk-test", client_id="client-1")
+        try:
+            sent = relay.requests_to(
+                "/api/mindrsi/v1/service/report/sess-0001/events"
+            )
+            assert len(sent) == 1
+            event = json.loads(sent[0].content)["events"][0]
+            assert event["type"] == "session.created"
+            assert event["data"]["session_id"] == "sess-0001"
+            assert event["data"]["client_id"] == "client-1"
+            assert event["data"]["sdk_version"]
+        finally:
+            client.close()
+
+    def test_a_retry_reports_upstream_retrying(self, service, relay, recorded):
+        """A retried request leaves a diagnostic event, but does not fail."""
+        trainer = service.create_lora_trainer(base_model="Qwen/Qwen3.8-27B")
+        recorded.clear()  # drop trainer.created
+        relay.fail_once_paths["/api/mindrsi/v1/train/get_info"] = (
+            503,
+            {"error": "busy"},
+        )
+
+        trainer.get_info()
+
+        events = [body for kind, body in recorded if kind == "event"]
+        retries = [e for e in events if e["type"] == "upstream.retrying"]
+        assert len(retries) == 1
+        assert retries[0]["level"] == "warning"
+        assert retries[0]["data"]["path"] == "/get_info"
+        assert retries[0]["data"]["reason"] == "HTTP 503"
+        assert retries[0]["data"]["attempt"] == 1
+        assert retries[0]["data"]["max_attempts"] == 3

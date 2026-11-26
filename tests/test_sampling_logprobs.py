@@ -217,7 +217,7 @@ class TestSamplerProvenance:
         """It blocks on the save, so there is no future left to await."""
         trainer = service.create_lora_trainer(base_model="Qwen/Qwen3.8-27B")
 
-        sampler = trainer.save_weights_and_get_sampler("step-1")
+        sampler = trainer.save_weights_and_get_sampler()
 
         assert isinstance(sampler, mind_recursive.Sampler)
         assert sampler.model_path is not None
